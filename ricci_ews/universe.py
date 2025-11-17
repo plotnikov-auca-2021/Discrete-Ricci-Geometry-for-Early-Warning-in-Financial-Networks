@@ -31,23 +31,28 @@ def compute_availability_mask(price_panel: pd.DataFrame) -> pd.Series:
     return availability
 
 
-def select_universe(price_panel: pd.DataFrame,
-                    max_missing_ratio: float | None = None) -> List[str]:
+def select_universe(
+    price_panel: pd.DataFrame,
+    max_missing_ratio: float | None = None
+) -> List[str]:
     """
-    Select fixed universe of tickers with at most max_missing_ratio missing data.
+    Select a fixed universe of tickers with at most max_missing_ratio missing data.
 
     Parameters
     ----------
     price_panel : DataFrame
-    max_missing_ratio : float
-        e.g. 0.05 means at least 95% availability.
+        index = date, columns = tickers
+    max_missing_ratio : float, optional
+        e.g. 0.05 means at least 95% availability. If None, falls back to config.MAX_MISSING_RATIO.
 
     Returns
     -------
-    list of tickers.
+    list[str]
+        Sorted list of tickers in the universe.
     """
     if max_missing_ratio is None:
         max_missing_ratio = config.MAX_MISSING_RATIO
+
     availability = compute_availability_mask(price_panel)
-    universe = availability[availability >= 1 - max_missing_ratio].index.tolist()
+    universe = availability[availability >= 1.0 - max_missing_ratio].index.tolist()
     return sorted(universe)
