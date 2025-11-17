@@ -7,14 +7,14 @@ Pipeline for a given return window R_window (W x N):
 1. Standardize returns within the window (zero mean, unit variance per asset).
 2. Fit graphical lasso on standardized returns to estimate precision matrix Θ̂.
 3. Convert Θ̂ to partial correlations ρ̃_ij.
-4. Define weights w_ij = |ρ̃_ij|^beta, with zeros on the diagonal.
+4. Define weights w_ij = |ρ̃_ij|^beta.
 5. Sparsify to achieve a target average degree (reusing correlation-graph sparsifier).
 6. Define edge lengths ℓ_ij = 1 / (w_ij^γ) + ε for existing edges.
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -43,24 +43,31 @@ except Exception:  # pragma: no cover - optional dependency
 def graphical_lasso_precision(
     Z_window: np.ndarray,
     lam: float,
-    max_iter: int = 200,
+    max_iter: int = 500,
+    tol: float = 1e-4,
 ) -> np.ndarray:
     """
     Fit graphical lasso on standardized returns and return precision matrix Θ̂.
+:
+    - First, tries GraphicalLasso with lam, lam*2, lam*5.
+    - If all attempts fail (e.g. Non-SPD errors), falls back to
+      a ridge-regularized covariance inversion.
 
     Parameters
     ----------
     Z_window : np.ndarray
         Standardized returns of shape (W, N) (zero mean, unit variance per column).
     lam : float
-        Regularization parameter (alpha in GraphicalLasso).
+        Baseline regularization parameter (alpha in GraphicalLasso).
     max_iter : int
         Maximum number of iterations for the solver.
+    tol : float
+        Convergence tolerance for the optimization.
 
     Returns
     -------
     theta_hat : np.ndarray
-        Estimated precision matrix (N x N), symmetric, positive definite.
+        Estimated precision matrix (N x N), symmetric.
     """
     if not _HAVE_SKLEARN:
         raise ImportError(
@@ -68,13 +75,51 @@ def graphical_lasso_precision(
             "Install with: pip install scikit-learn"
         )
 
-    model = GraphicalLasso(alpha=lam, max_iter=max_iter)
-    model.fit(Z_window)
-    theta_hat = np.asarray(model.precision_, dtype=float)
+    Z_window = np.asarray(Z_window, dtype=float)
+    _, n_features = Z_window.shape
 
-    # Numerical symmetrization (just in case)
-    theta_hat = 0.5 * (theta_hat + theta_hat.T)
-    return theta_hat
+    last_exception: Exception | None = None
+
+    # --- 1) Try GraphicalLasso with increasing alpha ---
+    alphas_to_try = [lam, lam * 2.0, lam * 5.0]
+
+    for alpha in alphas_to_try:
+        try:
+            model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
+            model.fit(Z_window)
+            theta_hat = np.asarray(model.precision_, dtype=float)
+            # Symmetrize for safety
+            theta_hat = 0.5 * (theta_hat + theta_hat.T)
+            return theta_hat
+        except FloatingPointError as e:
+            # Non-SPD or ill-conditioned system
+            last_exception = e
+            continue
+        except Exception as e:
+            # Any other numerical issue
+            last_exception = e
+            continue
+
+    # --- 2) Fallback: ridge-regularized covariance inversion ---
+    # Empirical covariance
+    S = np.cov(Z_window, rowvar=False)
+
+    # We will iteratively add jitter to the diagonal until inversion works
+    jitter = 1e-3
+    for _ in range(6):
+        try:
+            S_reg = S + jitter * np.eye(n_features)
+            theta_hat = np.linalg.inv(S_reg)
+            theta_hat = 0.5 * (theta_hat + theta_hat.T)
+            return theta_hat
+        except np.linalg.LinAlgError:
+            jitter *= 10.0  # increase regularization and retry
+
+    # If even the fallback fails, raise a clear error
+    raise RuntimeError(
+        "graphical_lasso_precision failed even with fallback. "
+        f"Last exception: {repr(last_exception)}"
+    )
 
 
 def partial_correlations(theta_hat: np.ndarray) -> np.ndarray:
@@ -101,7 +146,7 @@ def partial_correlations(theta_hat: np.ndarray) -> np.ndarray:
     # Guard against non-positive diagonals
     diag = np.where(diag <= 0, np.nan, diag)
     d = np.sqrt(diag)
-    # Replace any NaNs with a small positive number to avoid division by zero
+    # Replace any NaNs or zeros with a small positive number to avoid division by zero
     d = np.where(np.isnan(d) | (d == 0), 1e-8, d)
 
     outer_d = np.outer(d, d)
@@ -199,7 +244,7 @@ def build_precision_graph(
     # 1) Standardize within window (zero mean, unit variance per column)
     Z = standardize_within_window(R_window)
 
-    # 2) Graphical lasso precision matrix
+    # 2) Graphical lasso precision matrix (with robust fallback)
     theta_hat = graphical_lasso_precision(Z, lam=lam)
 
     # 3) Partial correlations

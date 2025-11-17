@@ -35,7 +35,7 @@ LENGTH_EXPONENT = 0.75
 LENGTH_EPS = 1e-4
 
 # Precision graph hyperparameters
-GLASSO_LAMBDA = 0.05
+GLASSO_LAMBDA = 0.1
 
 # Curvature hyperparameters
 ORC_ALPHA = 0.5
