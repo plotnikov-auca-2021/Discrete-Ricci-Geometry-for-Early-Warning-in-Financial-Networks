@@ -21,9 +21,9 @@ def load_prices(path: Path | str | None = None) -> pd.DataFrame:
     Load per-ticker stock price data.
 
     Expected columns in sp500_stocks.csv (you can adapt after inspecting the file):
-        - date
-        - ticker
-        - adj_close  (or 'Adj Close', 'adjclose', 'close', etc.)
+        - date / Date
+        - ticker or symbol (we normalize to 'ticker')
+        - adj_close / Adj Close / close (we normalize to 'adj_close')
 
     Returns
     -------
@@ -33,28 +33,49 @@ def load_prices(path: Path | str | None = None) -> pd.DataFrame:
         path = config.SP500_STOCKS_FILE
 
     df = pd.read_csv(path)
-    # Normalize column names
-    df.columns = [c.lower() for c in df.columns]
+    # Keep original names but also create a lower-case copy for matching
+    cols_lower = {c.lower(): c for c in df.columns}
 
-    if "date" not in df.columns:
-        raise ValueError("Expected a 'date' column in stock data.")
-    if "ticker" not in df.columns:
-        raise ValueError("Expected a 'ticker' column in stock data.")
+    # --- date column ---
+    if "date" in cols_lower:
+        date_col = cols_lower["date"]
+    else:
+        raise ValueError(
+            f"Expected a 'date' column in stock data, got columns: {list(df.columns)}"
+        )
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.rename(columns={date_col: "date"})
 
-    df["date"] = pd.to_datetime(df["date"])
+    # --- ticker / symbol column ---
+    ticker_col = None
+    for candidate in ["ticker", "symbol"]:
+        if candidate in cols_lower:
+            ticker_col = cols_lower[candidate]
+            break
+    if ticker_col is None:
+        raise ValueError(
+            "Expected a 'ticker' or 'symbol' column in stock data, "
+            f"got columns: {list(df.columns)}"
+        )
+    df = df.rename(columns={ticker_col: "ticker"})
 
-    # Try to identify adjusted close column
-    if "adj_close" not in df.columns:
-        if "adjclose" in df.columns:
-            df = df.rename(columns={"adjclose": "adj_close"})
-        elif "close" in df.columns:
-            df = df.rename(columns={"close": "adj_close"})
-        else:
-            raise ValueError(
-                "Could not find an adjusted price column. "
-                "Expected one of: 'adj_close', 'adjclose', 'close'."
-            )
+    # --- adjusted close / close column ---
+    adj_candidates = ["adj close", "adj_close", "adjclose", "close"]
+    adj_col = None
+    for candidate in adj_candidates:
+        if candidate in cols_lower:
+            adj_col = cols_lower[candidate]
+            break
+    if adj_col is None:
+        raise ValueError(
+            "Could not find an adjusted price column. "
+            "Expected one of: 'Adj Close', 'adj_close', 'adjclose', 'Close'. "
+            f"Got columns: {list(df.columns)}"
+        )
+    df = df.rename(columns={adj_col: "adj_close"})
 
+    # Keep only relevant columns plus any others you might need
+    # (here we keep everything; downstream code only uses date/ticker/adj_close)
     return df
 
 
@@ -63,10 +84,10 @@ def load_companies(path: Path | str | None = None) -> pd.DataFrame:
     Load company metadata.
 
     Expected columns (you can adapt as needed):
-        - ticker
-        - name
+        - ticker or symbol (we normalize to index 'ticker')
         - sector
         - industry / gics
+        - etc.
 
     Returns
     -------
@@ -76,11 +97,20 @@ def load_companies(path: Path | str | None = None) -> pd.DataFrame:
         path = config.SP500_COMPANIES_FILE
 
     df = pd.read_csv(path)
-    df.columns = [c.lower() for c in df.columns]
+    cols_lower = {c.lower(): c for c in df.columns}
 
-    if "ticker" not in df.columns:
-        raise ValueError("Expected a 'ticker' column in companies data.")
+    ticker_col = None
+    for candidate in ["ticker", "symbol"]:
+        if candidate in cols_lower:
+            ticker_col = cols_lower[candidate]
+            break
+    if ticker_col is None:
+        raise ValueError(
+            "Expected a 'ticker' or 'symbol' column in companies data, "
+            f"got columns: {list(df.columns)}"
+        )
 
+    df = df.rename(columns={ticker_col: "ticker"})
     df = df.set_index("ticker").sort_index()
     return df
 
@@ -90,8 +120,9 @@ def load_index_series(path: Path | str | None = None) -> pd.DataFrame:
     Load S&P 500 index level.
 
     Expected columns:
-        - date
-        - index_level  (or 'adj_close', 'close', 'sp500')
+        - date / Date
+        - index_level OR one of:
+          'adj_close', 'close', 's&p500', 'sp500', '^gspc', 'price'
 
     Returns
     -------
@@ -101,25 +132,45 @@ def load_index_series(path: Path | str | None = None) -> pd.DataFrame:
         path = config.SP500_INDEX_FILE
 
     df = pd.read_csv(path)
-    df.columns = [c.lower() for c in df.columns]
+    cols_lower = {c.lower(): c for c in df.columns}
 
-    if "date" not in df.columns:
-        raise ValueError("Expected a 'date' column in index data.")
-    df["date"] = pd.to_datetime(df["date"])
+    # --- date column ---
+    if "date" in cols_lower:
+        date_col = cols_lower["date"]
+    else:
+        raise ValueError(
+            f"Expected a 'date' column in index data, got columns: {list(df.columns)}"
+        )
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.rename(columns={date_col: "date"})
 
-    # Try to infer index level column
-    if "index_level" not in df.columns:
-        for alt in ("adj_close", "close", "sp500", "price"):
-            if alt in df.columns:
-                df = df.rename(columns={alt: "index_level"})
+    # --- index level column ---
+    if "index_level" in cols_lower:
+        idx_col = cols_lower["index_level"]
+    else:
+        alt_candidates = [
+            "adj_close",
+            "close",
+            "s&p500",
+            "sp500",
+            "^gspc",
+            "price",
+        ]
+        idx_col = None
+        for candidate in alt_candidates:
+            if candidate in cols_lower:
+                idx_col = cols_lower[candidate]
                 break
 
-    if "index_level" not in df.columns:
-        raise ValueError(
-            "Could not infer 'index_level' column in index data. "
-            "Expected one of: 'index_level', 'adj_close', 'close', 'sp500', 'price'."
-        )
+        if idx_col is None:
+            raise ValueError(
+                "Could not infer index level column in index data. "
+                "Expected one of: 'index_level', 'Adj Close', 'Close', "
+                "'S&P500', 'sp500', '^GSPC', 'price'. "
+                f"Got columns: {list(df.columns)}"
+            )
 
+    df = df.rename(columns={idx_col: "index_level"})
     df = df.sort_values("date").set_index("date")
     return df[["index_level"]]
 
