@@ -48,7 +48,7 @@ def graphical_lasso_precision(
 ) -> np.ndarray:
     """
     Fit graphical lasso on standardized returns and return precision matrix Θ̂.
-:
+
     - First, tries GraphicalLasso with lam, lam*2, lam*5.
     - If all attempts fail (e.g. Non-SPD errors), falls back to
       a ridge-regularized covariance inversion.

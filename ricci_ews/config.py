@@ -6,6 +6,7 @@ You can modify values here to change window size, horizons, and model choices.
 
 from pathlib import Path
 
+
 # Paths
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
