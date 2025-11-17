@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Sequence
 
 import numpy as np
+import warnings
 
 from . import config
 from .returns import standardize_within_window
@@ -29,6 +30,7 @@ from .graphs_correlation import (
 # Graphical lasso from scikit-learn
 try:
     from sklearn.covariance import GraphicalLasso  # type: ignore
+    from sklearn.exceptions import ConvergenceWarning  # type: ignore
 
     _HAVE_SKLEARN = True
 except Exception:  # pragma: no cover - optional dependency
@@ -49,8 +51,10 @@ def graphical_lasso_precision(
     """
     Fit graphical lasso on standardized returns and return precision matrix Θ̂.
 
+    This version is robust:
     - First, tries GraphicalLasso with lam, lam*2, lam*5.
-    - If all attempts fail (e.g. Non-SPD errors), falls back to
+      Any ConvergenceWarning is treated as a failure (we don't trust it).
+    - If all attempts fail (warnings or numerical errors), falls back to
       a ridge-regularized covariance inversion.
 
     Parameters
@@ -86,13 +90,19 @@ def graphical_lasso_precision(
     for alpha in alphas_to_try:
         try:
             model = GraphicalLasso(alpha=alpha, max_iter=max_iter, tol=tol)
-            model.fit(Z_window)
+
+            # Treat ConvergenceWarning as an error so we can fall back cleanly
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ConvergenceWarning)
+                model.fit(Z_window)
+
             theta_hat = np.asarray(model.precision_, dtype=float)
             # Symmetrize for safety
             theta_hat = 0.5 * (theta_hat + theta_hat.T)
             return theta_hat
-        except FloatingPointError as e:
-            # Non-SPD or ill-conditioned system
+
+        except (FloatingPointError, ConvergenceWarning) as e:
+            # Non-SPD, ill-conditioned, or did not converge
             last_exception = e
             continue
         except Exception as e:
