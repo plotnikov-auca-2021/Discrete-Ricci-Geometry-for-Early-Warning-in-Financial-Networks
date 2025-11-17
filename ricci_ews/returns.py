@@ -30,28 +30,39 @@ def compute_log_returns(price_panel: pd.DataFrame) -> pd.DataFrame:
     return rets
 
 
-def align_and_rectangularize(returns_panel: pd.DataFrame,
-                             universe: List[str]) -> pd.DataFrame:
+def align_and_rectangularize(
+    returns_panel: pd.DataFrame,
+    universe: List[str],
+) -> pd.DataFrame:
     """
-    Keep only tickers in universe and drop dates with any missing values.
+    Keep only tickers in universe and drop all dates with any missing values.
+
+    This enforces a rectangular panel (no NaNs) for the fixed universe U,
+    which is required by the graph construction.
 
     Parameters
     ----------
     returns_panel : DataFrame
-    universe : list of tickers
+        index = date, columns = tickers
+    universe : list[str]
+        Fixed asset universe.
 
     Returns
     -------
     rectangular_returns : DataFrame
         index = date, columns = universe, no missing values.
     """
-    sub = returns_panel[universe].dropna(how="any")
+    sub = returns_panel[universe]
+    # First row is typically NaN due to differencing; drop any rows with NaNs
+    sub = sub.dropna(how="any")
     return sub
 
 
-def winsorize_returns(returns_panel: pd.DataFrame,
-                      lower_q: float = 0.001,
-                      upper_q: float = 0.999) -> pd.DataFrame:
+def winsorize_returns(
+    returns_panel: pd.DataFrame,
+    lower_q: float = 0.001,
+    upper_q: float = 0.999,
+) -> pd.DataFrame:
     """
     Winsorize returns at given quantiles across all assets.
 
@@ -82,7 +93,7 @@ def standardize_within_window(R_window: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    standardized : np.ndarray
+    standardized : np.ndarray of shape (W, N)
     """
     mean = np.mean(R_window, axis=0, keepdims=True)
     std = np.std(R_window, axis=0, ddof=1, keepdims=True)
