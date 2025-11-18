@@ -1,5 +1,5 @@
 """
-Quick test of build_correlation_graph on a single rolling window.
+Test of build_correlation_graph on a single rolling window.
 
 Run from project root:
     python -m scripts.test_correlation_graph

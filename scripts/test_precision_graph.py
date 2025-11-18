@@ -1,13 +1,5 @@
 """
 Quick test of build_precision_graph on a single rolling window.
-
-Run from the project root:
-
-    python -m scripts.test_precision_graph
-
-Requirements:
-    - scikit-learn installed (for GraphicalLasso):
-        pip install scikit-learn
 """
 
 from __future__ import annotations

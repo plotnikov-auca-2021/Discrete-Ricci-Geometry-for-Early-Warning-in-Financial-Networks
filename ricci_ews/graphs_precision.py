@@ -50,13 +50,6 @@ def graphical_lasso_precision(
 ) -> np.ndarray:
     """
     Fit graphical lasso on standardized returns and return precision matrix Θ̂.
-
-    This version is robust:
-    - First, tries GraphicalLasso with lam, lam*2, lam*5.
-      Any ConvergenceWarning is treated as a failure (we don't trust it).
-    - If all attempts fail (warnings or numerical errors), falls back to
-      a ridge-regularized covariance inversion.
-
     Parameters
     ----------
     Z_window : np.ndarray

@@ -1,13 +1,6 @@
 """
 Entry point for running the full walk-forward experiment.
 
-At this stage, the core pipeline is only scaffolded. Once the modules
-(graphs, curvature, features, labels, models, pipeline) are implemented,
-you can run:
-
-    python -m scripts.run_walkforward
-
-from the project root.
 """
 
 from ricci_ews import config

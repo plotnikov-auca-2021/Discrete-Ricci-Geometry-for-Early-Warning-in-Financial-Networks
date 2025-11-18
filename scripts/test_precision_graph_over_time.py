@@ -1,16 +1,6 @@
 """
 Test precision-based graph over multiple rolling windows.
 
-Run from project root:
-    python -m scripts.test_precision_graph_over_time
-
-This script:
-- loads S&P 500 data
-- builds the universe & rectangular return panel
-- iterates over multiple rolling windows
-- for each window, constructs the precision-based graph (graphical lasso)
-- records degree and weight statistics over time
-- saves metrics to 'precision_graph_metrics_over_time.csv'
 """
 
 from __future__ import annotations

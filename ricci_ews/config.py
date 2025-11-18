@@ -1,7 +1,5 @@
 """
 Configuration and hyperparameters for the Ricci curvature early-warning project.
-
-You can modify values here to change window size, horizons, and model choices.
 """
 
 from pathlib import Path

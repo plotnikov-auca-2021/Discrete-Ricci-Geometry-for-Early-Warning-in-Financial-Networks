@@ -6,20 +6,6 @@ rolling windows, for BOTH:
     - correlation-based graphs
     - precision-based (graphical lasso) graphs
 
-Run from project root:
-
-    python -m scripts.test_curvature_over_time
-
-Outputs:
-    curvature_metrics_over_time.csv
-
-Each row = one rolling window.
-Columns include summary stats for:
-    - corr_edge_orc_*   (edge-level ORC on correlation graph)
-    - corr_edge_frc_*   (edge-level FRC on correlation graph)
-    - corr_node_orc_*   (node-level ORC on correlation graph)
-    - corr_node_frc_*   (node-level FRC on correlation graph)
-    - prec_edge_orc_*, prec_edge_frc_*, prec_node_orc_*, prec_node_frc_*
 """
 
 from __future__ import annotations

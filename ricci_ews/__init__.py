@@ -14,7 +14,5 @@ This package contains all core modules:
 - probes: mechanistic probes (diffusion, robustness, etc.)
 - models: ML models and evaluation helpers
 - pipeline: end-to-end walk-forward orchestration
-- utils: small shared helpers
-
-Most functions are written so that they can be unit-tested in isolation.
+- utils: small shared helpers, unit tests
 """

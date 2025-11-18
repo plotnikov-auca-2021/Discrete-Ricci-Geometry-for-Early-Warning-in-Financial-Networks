@@ -3,7 +3,7 @@ curvature.py
 
 Ollivier–Ricci (ORC) and Forman–Ricci (FRC) curvature on weighted graphs.
 
-This module operates on GraphData objects (see graphs_correlation.py):
+This module operates on GraphData objects
 
     GraphData(
         W: np.ndarray  # edge weights w_ij >= 0
@@ -11,33 +11,6 @@ This module operates on GraphData objects (see graphs_correlation.py):
         adjacency: np.ndarray  # 0/1 adjacency
         nodes: List[str]       # node labels
     )
-
-Formulas follow the Methodology section of the proposal:
-
-- ORC (edge (i,j)):
-
-    μ_i = (1 - α) δ_i + α * Σ_{k~i} p_ik δ_k,
-    p_ik = w_ik / Σ_{ℓ~i} w_iℓ,   α ∈ [0.5, 0.9]
-
-    W1(μ_i, μ_j) = min_{π >= 0} Σ_{x,y} d(x,y) π(x,y)
-                   s.t. Σ_y π(x,y) = μ_i(x), Σ_x π(x,y) = μ_j(y)
-
-    κ_ij^ORC = 1 - W1(μ_i, μ_j) / d(i,j)
-
-- FRC (edge (i,j)):
-
-    w_i = Σ_{k~i} w_ik  (node strength)
-
-    F_ij = w_ij * (
-        w_i / w_ij + w_j / w_ij
-        - Σ_{k~i, k≠j} w_i / sqrt(w_ij w_ik)
-        - Σ_{ℓ~j, ℓ≠i} w_j / sqrt(w_ij w_jℓ)
-    )
-
-Node-level curvature is the incident-edge average:
-
-    κ_i = (1 / deg(i)) Σ_{j~i} κ_ij
-    F_i = (1 / deg(i)) Σ_{j~i} F_ij
 """
 
 from __future__ import annotations
@@ -134,15 +107,6 @@ def _wasserstein_1(mu_i: np.ndarray, mu_j: np.ndarray, C: np.ndarray) -> float:
     -------
     W1 : float
         Earth-mover distance between mu_i and mu_j.
-
-    Notes
-    -----
-    - We solve:
-
-        min π >= 0  Σ_{a,b} C[a,b] π[a,b]
-        s.t. Σ_b π[a,b] = mu_i[a],  Σ_a π[a,b] = mu_j[b].
-
-    - Implemented with scipy.optimize.linprog (HiGHS backend).
     """
     mu_i = np.asarray(mu_i, dtype=float)
     mu_j = np.asarray(mu_j, dtype=float)
@@ -283,15 +247,6 @@ def ollivier_ricci_edge_curvature(
     kappa : np.ndarray
         Edge-level ORC matrix (N x N), symmetric, with kappa[i,j] = 0 where
         there is no edge.
-
-    Notes
-    -----
-    For each edge (i,j):
-
-      - Build neighbor measures μ_i, μ_j on the local support
-        S = {i} ∪ N(i) ∪ {j} ∪ N(j).
-      - Compute W1(μ_i, μ_j) using LP on S with costs d(·,·).
-      - Set κ_ij = 1 - W1(μ_i, μ_j) / d(i,j).
     """
     W = np.asarray(G.W, dtype=float)
     L = np.asarray(G.L, dtype=float)
