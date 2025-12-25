@@ -1,10 +1,5 @@
 """
 features.py
-
-Feature construction as in Section 3.8 of the proposal.
-
-We focus on two main parts:
-
 1. Curvature feature vector x_t
    - Built from edge- and vertex-level Ollivier–Ricci (ORC) and
      Forman–Ricci (FRC) aggregates for BOTH graph families:
@@ -37,22 +32,7 @@ Given for each date t:
   - G_prec_t: GraphData for precision graph (Θ)
   - curv_prec_t: CurvatureResult for G_prec_t
 
-You can do:
 
-    from ricci_ews import features
-
-    row_xt = features.compute_curvature_features_for_date(
-        G_corr=G_corr_t,
-        curv_corr=curv_corr_t,
-        G_prec=G_prec_t,
-        curv_prec=curv_prec_t,
-    )
-
-Collect these rows into a DataFrame indexed by date, then apply:
-
-    x_df_full = features.add_ewma_features(x_df_raw)
-
-to augment with EWMA curvature features over time.
 """
 
 from __future__ import annotations
