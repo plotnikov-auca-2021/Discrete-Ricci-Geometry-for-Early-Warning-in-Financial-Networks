@@ -386,74 +386,56 @@ def _safe_metric(fn, y_true, y_score, default=np.nan) -> float:
         return float(default)
 
 
-def evaluate_model(
-    fitted: FittedModel,
-    X_test: pd.DataFrame,
-    y_test: pd.Series | np.ndarray,
-    positive_label: float = 1.0,
-) -> Dict[str, float]:
+def evaluate_model(model, X_test, y_test, threshold: float = 0.5):
     """
-    Evaluate a fitted model on a test set.
-
-    Metrics:
-      - roc_auc:   ROC AUC
-      - pr_auc:    Average precision / PR AUC
-      - brier:     Brier score for probabilities
-      - log_loss:  Logarithmic loss
-      - pos_rate:  Fraction of positives in y_test
-      - n_samples: Number of test samples
-
-    Parameters
-    ----------
-    fitted : FittedModel
-        Trained model.
-    X_test : pd.DataFrame
-        Test features, indexed by date.
-    y_test : 1D array-like
-        True labels (0/1), aligned with X_test.
-    positive_label : float
-        Label considered as "positive" (default 1.0).
-
-    Returns
-    -------
-    metrics : dict
+    Safe evaluation for rare-event labels:
+    - log_loss computed even if y_test has a single class
+    - ROC AUC / PR AUC only computed if both classes present
+    - no PR-curve warnings when there are no positives
     """
-    y_true = np.asarray(y_test, dtype=float)
-    # we assume binary labels {0,1}; if different mapping, you can adapt
-    probs = predict_proba(fitted, X_test)
+    import numpy as np
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score, f1_score,
+        roc_auc_score, average_precision_score,
+        brier_score_loss, log_loss
+    )
 
-    # Basic sanity: filter finite entries
-    mask = np.isfinite(probs) & np.isfinite(y_true)
-    if not mask.any():
-        return {
-            "roc_auc": np.nan,
-            "pr_auc": np.nan,
-            "brier": np.nan,
-            "log_loss": np.nan,
-            "pos_rate": np.nan,
-            "n_samples": 0,
-        }
+    y = np.asarray(y_test).astype(int)
 
-    y_true = y_true[mask]
-    p = probs[mask]
+    # probabilities
+    if hasattr(model, "predict_proba"):
+        p = model.predict_proba(X_test)[:, 1]
+    else:
+        # fallback: treat decision_function outputs as logits
+        s = model.decision_function(X_test)
+        p = 1.0 / (1.0 + np.exp(-s))
 
-    # Map labels to {0,1} relative to positive_label
-    y_bin = (y_true == positive_label).astype(float)
-    pos_rate = float(y_bin.mean())
+    p = np.asarray(p, dtype=float)
+    p = np.clip(p, 1e-12, 1 - 1e-12)
 
-    roc_auc = _safe_metric(roc_auc_score, y_bin, p)
-    pr_auc = _safe_metric(average_precision_score, y_bin, p)
+    y_pred = (p >= threshold).astype(int)
 
-    # Brier & log-loss need probabilities in [0,1]
-    p_clipped = np.clip(p, 1e-6, 1 - 1e-6)
-    brier = _safe_metric(brier_score_loss, y_bin, p_clipped)
-    ll = _safe_metric(log_loss, y_bin, p_clipped)
+    out = {}
+    out["n_samples"] = int(len(y))
+    out["pos_rate"] = float(np.mean(y)) if len(y) else np.nan
 
-    return {
-        "roc_auc": roc_auc,
-        "pr_auc": pr_auc,
-        "brier": brier,
-        "log_loss": ll,
-        "pos_rate": pos_rate,
-        "n_samples": int(len(y_bin)),
-    }
+    # Always defined (even if y is all 0s), as long as we set labels
+    out["log_loss"] = float(log_loss(y, p, labels=[0, 1]))
+    out["brier"] = float(brier_score_loss(y, p))
+
+    # Standard classification metrics (may be ill-defined if no positives; use zero_division=0)
+    out["accuracy"] = float(accuracy_score(y, y_pred))
+    out["precision"] = float(precision_score(y, y_pred, zero_division=0))
+    out["recall"] = float(recall_score(y, y_pred, zero_division=0))
+    out["f1"] = float(f1_score(y, y_pred, zero_division=0))
+
+    # AUC metrics only if both classes present
+    if len(np.unique(y)) == 2:
+        out["roc_auc"] = float(roc_auc_score(y, p))
+        out["pr_auc"] = float(average_precision_score(y, p))
+    else:
+        out["roc_auc"] = np.nan
+        out["pr_auc"] = np.nan
+
+    out["error"] = ""
+    return out

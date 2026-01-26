@@ -1,83 +1,139 @@
-"""
-Rolling-window generation and time-based splits.
-"""
-
+# ricci_ews/windows.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from . import config
 
-
-@dataclass
+@dataclass(frozen=True)
 class RollingWindow:
-    end_date: pd.Timestamp
+    """
+    A single rolling window over a returns matrix.
+
+    R_win is a numpy array with shape (W, N) and dates_win is a DatetimeIndex of length W.
+    """
+    window_id: int
     start_date: pd.Timestamp
-    data: np.ndarray  # shape (W, N)
+    end_date: pd.Timestamp
+    start_idx: int
+    end_idx: int
+    dates_win: pd.DatetimeIndex
+    R_win: np.ndarray
 
 
-class RollingWindowGenerator:
+def build_date_to_pos(dates: pd.DatetimeIndex) -> Dict[pd.Timestamp, int]:
     """
-    Helper to iterate over overlapping rolling windows of fixed length W.
+    Map each timestamp in dates -> integer position.
+    Use this for O(1) endpoint lookup.
     """
-
-    def __init__(self, returns_panel: pd.DataFrame, window_size: int | None = None):
-        """
-        Parameters
-        ----------
-        returns_panel : DataFrame
-            Rectangular log-return panel: index = date, columns = tickers.
-        window_size : int, optional
-            Default is config.WINDOW_SIZE.
-        """
-        self.returns_panel = returns_panel.sort_index()
-        self.window_size = window_size or config.WINDOW_SIZE
-
-    def iter_windows(self) -> Iterator[RollingWindow]:
-        """
-        Yield rolling windows of shape (W, N), each labeled by (start_date, end_date).
-        """
-        dates = self.returns_panel.index
-        W = self.window_size
-        if len(dates) < W:
-            return  # nothing to yield
-
-        for i in range(W - 1, len(dates)):
-            end = dates[i]
-            start = dates[i - W + 1]
-            window_df = self.returns_panel.iloc[i - W + 1 : i + 1]
-            yield RollingWindow(
-                end_date=end,
-                start_date=start,
-                data=window_df.to_numpy(copy=True),
-            )
+    # Ensure uniqueness & monotonicity are not strictly required, but recommended
+    return {pd.Timestamp(d): i for i, d in enumerate(dates)}
 
 
-def split_validation_evaluation(
-    dates: pd.Index,
-    validation_end: str | None = None,
-) -> Tuple[pd.Index, pd.Index]:
+def get_window_bounds_for_endpoint(
+    end_date: pd.Timestamp,
+    date_to_pos: Dict[pd.Timestamp, int],
+    window_size: int,
+) -> Optional[Tuple[int, int]]:
     """
-    Split dates into validation and evaluation sets.
-
-    Parameters
-    ----------
-    dates : DatetimeIndex
-    validation_end : str or None
-        If None, uses config.VALIDATION_END_DATE.
-
-    Returns
-    -------
-    (validation_dates, evaluation_dates) : (DatetimeIndex, DatetimeIndex)
+    For a given end_date, return (start_idx, end_idx) inclusive bounds for a window of length window_size.
+    Returns None if:
+      - end_date is not in date_to_pos
+      - not enough history for a full window
     """
-    if validation_end is None:
-        validation_end = config.VALIDATION_END_DATE
+    end_date = pd.Timestamp(end_date)
+    if end_date not in date_to_pos:
+        return None
 
-    cut = pd.to_datetime(validation_end)
-    validation = dates[dates <= cut]
-    evaluation = dates[dates > cut]
-    return validation, evaluation
+    end_idx = date_to_pos[end_date]
+    start_idx = end_idx - window_size + 1
+    if start_idx < 0:
+        return None
+
+    return start_idx, end_idx
+
+
+def iter_analysis_return_windows(
+    rets_rect: pd.DataFrame,
+    analysis_dates: pd.DatetimeIndex,
+    window_size: int = 252,
+    stride: int = 1,
+    start_window_id: int = 0,
+) -> Iterator[RollingWindow]:
+    """
+    Iterate rolling windows whose endpoints are ONLY in analysis_dates.
+
+    Notes:
+      - rets_rect should include warmup+analysis data (so early analysis endpoints can have full history).
+      - analysis_dates should be a subset of rets_rect.index (after warmup).
+      - stride is applied over analysis_dates (e.g., stride=5 means every 5th analysis endpoint).
+
+    Yields:
+      RollingWindow objects with (W, N) numpy arrays.
+    """
+    if window_size <= 0:
+        raise ValueError("window_size must be positive.")
+    if stride <= 0:
+        raise ValueError("stride must be positive.")
+    if rets_rect.empty:
+        return
+
+    dates = rets_rect.index
+    date_to_pos = build_date_to_pos(dates)
+
+    # Ensure analysis_dates are sorted and unique-like
+    analysis_dates = pd.DatetimeIndex(pd.to_datetime(analysis_dates)).sort_values()
+
+    window_id = start_window_id
+
+    # Iterate only over analysis endpoints, applying stride there
+    for end_date in analysis_dates[::stride]:
+        bounds = get_window_bounds_for_endpoint(end_date, date_to_pos, window_size)
+        if bounds is None:
+            continue
+
+        start_idx, end_idx = bounds
+        dates_win = dates[start_idx : end_idx + 1]
+
+        # Extract W x N values (as numpy) for speed
+        R_win = rets_rect.iloc[start_idx : end_idx + 1].to_numpy(dtype=float, copy=False)
+
+        # Skip if shape mismatch (should not happen, but safe)
+        if R_win.shape[0] != window_size:
+            continue
+
+        yield RollingWindow(
+            window_id=window_id,
+            start_date=pd.Timestamp(dates_win[0]),
+            end_date=pd.Timestamp(dates_win[-1]),
+            start_idx=start_idx,
+            end_idx=end_idx,
+            dates_win=dates_win,
+            R_win=R_win,
+        )
+        window_id += 1
+
+
+def iter_analysis_windows_with_node_names(
+    rets_rect: pd.DataFrame,
+    analysis_dates: pd.DatetimeIndex,
+    window_size: int = 252,
+    stride: int = 1,
+    start_window_id: int = 0,
+):
+    """
+    Convenience iterator: yields (RollingWindow, node_names)
+    node_names are the tickers / columns in rets_rect.
+    """
+    node_names = list(rets_rect.columns)
+    for win in iter_analysis_return_windows(
+        rets_rect=rets_rect,
+        analysis_dates=analysis_dates,
+        window_size=window_size,
+        stride=stride,
+        start_window_id=start_window_id,
+    ):
+        yield win, node_names

@@ -3,8 +3,7 @@ Entry point for running the full walk-forward experiment.
 
 """
 
-from ricci_ews import config
-from ricci_ews import pipeline
+from pipeline import pipeline
 
 
 def main():

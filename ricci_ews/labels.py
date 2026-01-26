@@ -64,397 +64,184 @@ where labels_df contains forward RV/DD and their binary labels, indexed
 by date t (the "current" day used for features), and meta contains
 threshold information for reproducibility.
 """
-
+# ricci_ews/labels.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from . import config
 
-
-# ----------------------------------------------------------------------
-# Helpers for defaults from config
-# ----------------------------------------------------------------------
-
-
-def _get_default_horizons() -> Tuple[int, ...]:
+def _pct_to_tag(p: float) -> str:
     """
-    Horizon set H used for forward-looking labels.
-
-    Defaults to config.HORIZONS if present, otherwise (5, 10, 20).
+    Convert pct (e.g., 0.03) into a compact tag.
+      0.03 -> "3"
+      0.025 -> "2p5"
+      0.001 -> "0p1"
+    Interpreted as *percent*, i.e., multiply by 100.
     """
-    default = (5, 10, 20)
-    horizons = getattr(config, "HORIZONS", default)
-    if isinstance(horizons, (list, tuple)):
-        return tuple(int(h) for h in horizons)
-    return default
+    x = 100.0 * float(p)
+    # close to integer?
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    # close to 1 decimal?
+    if abs(x * 10 - round(x * 10)) < 1e-9:
+        s = f"{x:.1f}"
+        return s.replace(".", "p").rstrip("0").rstrip("p")
+    # fallback: 2 decimals
+    s = f"{x:.2f}"
+    s = s.rstrip("0").rstrip(".")
+    return s.replace(".", "p")
 
 
-def _get_default_dd_thresholds() -> Tuple[float, ...]:
+def _forward_matrix(rets: pd.Series, h: int) -> pd.DataFrame:
     """
-    Drawdown thresholds δ used for binary labels.
-
-    Defaults to config.DD_THRESHOLDS if present, otherwise (0.03, 0.05, 0.07).
+    Build T x h matrix of future returns:
+      col k contains r_{t+k+1}
     """
-    default = (0.03, 0.05, 0.07)
-    dd = getattr(config, "DD_THRESHOLDS", default)
-    if isinstance(dd, (list, tuple)):
-        return tuple(float(x) for x in dd)
-    return default
+    cols = [rets.shift(-(k + 1)) for k in range(h)]
+    mat = pd.concat(cols, axis=1)
+    mat.columns = [f"t+{k+1}" for k in range(h)]
+    return mat
 
 
-def _get_default_vol_quantile() -> float:
+def _forward_realized_vol(rets: pd.Series, h: int) -> pd.Series:
     """
-    Quantile level q for high-volatility labels.
-
-    Defaults to config.VOL_QUANTILE if present, otherwise 0.8.
+    Forward realized volatility over next h days:
+      vol_t = std( r_{t+1}, ..., r_{t+h} )
     """
-    return float(getattr(config, "VOL_QUANTILE", 0.8))
+    M = _forward_matrix(rets, h)
+    return M.std(axis=1, ddof=0)
 
 
-# ----------------------------------------------------------------------
-# Forward realized volatility and drawdown
-# ----------------------------------------------------------------------
-
-
-def compute_forward_realized_volatility(
-    index_log_returns: pd.Series,
-    horizons: Sequence[int] | None = None,
-) -> pd.DataFrame:
+def _forward_max_drawdown_mag(rets: pd.Series, h: int) -> pd.Series:
     """
-    Compute forward realized volatility RV_{t,h} for each horizon h.
+    Forward max drawdown magnitude over next h days, computed on the
+    forward price path starting at 1.0.
 
-    Parameters
-    ----------
-    index_log_returns : pd.Series
-        Log-returns of the index, r_t, indexed by date (e.g. S&P 500).
-        These should be aligned with the dates of the stock-return panel
-        used for feature windows (i.e. same index as rets_rect).
-    horizons : sequence of int, optional
-        Forward horizons h (in trading days). If None, uses config.HORIZONS.
-
-    Returns
-    -------
-    rv_df : pd.DataFrame
-        DataFrame indexed by date t, with one column per horizon:
-
-            rv_h5, rv_h10, rv_h20, ...
-
-        At date t, rv_h{h}[t] = RV_{t,h} uses returns r_{t+1}..r_{t+h}.
-        The last h rows are NaN because not enough forward data.
+    For each t:
+      f = [r_{t+1},...,r_{t+h}]
+      P_0 = 1
+      P_k = exp(sum_{i=1..k} f_i)
+      DD = min_k (P_k / max_{j<=k} P_j - 1)
+      magnitude = -DD (>=0)
     """
-    if horizons is None:
-        horizons = _get_default_horizons()
+    r = rets.values.astype(float)
+    T = len(r)
+    out = np.full(T, np.nan, dtype=float)
 
-    r = index_log_returns.sort_index().astype(float)
-    dates = r.index
-    arr = r.values
-    T = len(arr)
-
-    out: Dict[str, np.ndarray] = {}
-
-    for h in horizons:
-        h = int(h)
-        if h <= 0:
+    # compute with small loop (h is small: 5/10/15/20 etc)
+    for i in range(T - h):
+        f = r[i + 1 : i + h + 1]
+        if np.any(~np.isfinite(f)):
             continue
-        rv = np.full(T, np.nan, dtype=float)
-        # For each t, use future returns r_{t+1},...,r_{t+h}
-        for t in range(T - h):
-            window = arr[t + 1 : t + 1 + h]
-            if window.size != h:
-                continue
-            rv[t] = np.sqrt(252.0 / h * np.sum(window ** 2))
-        out[f"rv_h{h}"] = rv
-
-    rv_df = pd.DataFrame(out, index=dates)
-    return rv_df
-
-
-def compute_forward_max_drawdown(
-    index_log_returns: pd.Series,
-    horizons: Sequence[int] | None = None,
-) -> pd.DataFrame:
-    """
-    Compute forward maximum drawdown DD_{t,h} for each horizon h.
-
-    We work purely in log-return space, as described in the module
-    docstring: starting from S_0 = 0, S_k = sum_{i=1}^k r_{t+i},
-    and then converting back to simple drawdowns.
-
-    Parameters
-    ----------
-    index_log_returns : pd.Series
-        Log-returns of the index, r_t, indexed by date.
-    horizons : sequence of int, optional
-        Forward horizons h (in trading days). If None, uses config.HORIZONS.
-
-    Returns
-    -------
-    dd_df : pd.DataFrame
-        DataFrame indexed by date t, with one column per horizon:
-
-            dd_h5, dd_h10, dd_h20, ...
-
-        At date t, dd_h{h}[t] = DD_{t,h} ∈ [0,1] is the largest
-        peak-to-trough percentage loss over the next h days.
-        The last h rows are NaN because not enough forward data.
-    """
-    if horizons is None:
-        horizons = _get_default_horizons()
-
-    r = index_log_returns.sort_index().astype(float)
-    dates = r.index
-    arr = r.values
-    T = len(arr)
-
-    out: Dict[str, np.ndarray] = {}
-
-    for h in horizons:
-        h = int(h)
-        if h <= 0:
-            continue
-        dd = np.full(T, np.nan, dtype=float)
-        # For each t, use future returns r_{t+1},...,r_{t+h}
-        for t in range(T - h):
-            window = arr[t + 1 : t + 1 + h]
-            if window.size == 0:
-                continue
-            # Log-price path relative to S_0=0, including initial level
-            cum = np.concatenate(([0.0], np.cumsum(window)))  # length h+1
-            running_max = np.maximum.accumulate(cum)
-            dd_log = running_max - cum  # >= 0
-            # Convert log drawdowns to simple percentage losses:
-            # If Δ = log(P_max / P), then drop = 1 - exp(-Δ).
-            dd_simple = 1.0 - np.exp(-dd_log)
-            dd[t] = float(dd_simple.max())
-        out[f"dd_h{h}"] = dd
-
-    dd_df = pd.DataFrame(out, index=dates)
-    return dd_df
-
-
-# ----------------------------------------------------------------------
-# Binary labels: volatility and drawdown
-# ----------------------------------------------------------------------
-
-
-def make_volatility_labels(
-    rv_df: pd.DataFrame,
-    vol_quantile: float | None = None,
-    prefix: str = "y_vol",
-) -> Tuple[pd.DataFrame, Dict[int, float]]:
-    """
-    Construct high-volatility binary labels y^{Vol}_{t,h} from forward
-    realized volatility RV_{t,h}.
-
-    Parameters
-    ----------
-    rv_df : pd.DataFrame
-        Output of compute_forward_realized_volatility, with columns
-        'rv_h{h}' for each horizon h, indexed by date t.
-    vol_quantile : float, optional
-        Quantile level q for "high volatility" events. If None, uses
-        config.VOL_QUANTILE.
-    prefix : str
-        Prefix for label column names. Labels for horizon h will be
-        named '{prefix}_h{h}', e.g. 'y_vol_h5'.
-
-    Returns
-    -------
-    labels_df : pd.DataFrame
-        DataFrame with one binary column per horizon, indexed by date t.
-    thresholds : dict
-        Mapping h -> q_{Vol}(h), the numeric threshold used for each
-        horizon.
-    """
-    if vol_quantile is None:
-        vol_quantile = _get_default_vol_quantile()
-
-    labels = {}
-    thresholds: Dict[int, float] = {}
-
-    for col in rv_df.columns:
-        if not col.startswith("rv_h"):
-            continue
-        # Parse horizon h from column name 'rv_h{h}'
-        try:
-            h = int(col.split("h", 1)[1])
-        except Exception:
-            continue
-
-        series = rv_df[col].astype(float)
-        # Use only finite values to estimate threshold
-        finite_vals = series[np.isfinite(series)]
-        if finite_vals.empty:
-            thresh = np.nan
-            labels_col = pd.Series(np.nan, index=series.index)
-        else:
-            thresh = float(finite_vals.quantile(vol_quantile))
-            labels_col = (series >= thresh).astype(float)
-        labels[f"{prefix}_h{h}"] = labels_col
-        thresholds[h] = thresh
-
-    labels_df = pd.DataFrame(labels, index=rv_df.index)
-    return labels_df, thresholds
-
-
-def make_drawdown_labels(
-    dd_df: pd.DataFrame,
-    dd_thresholds: Sequence[float] | None = None,
-    prefix: str = "y_dd",
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    Construct binary drawdown-event labels y^{DD,δ}_{t,h} from forward
-    maximum drawdown DD_{t,h}, for a set of fixed thresholds δ.
-
-    Parameters
-    ----------
-    dd_df : pd.DataFrame
-        Output of compute_forward_max_drawdown, with columns 'dd_h{h}'.
-    dd_thresholds : sequence of float, optional
-        Drawdown thresholds δ ∈ (0,1), e.g. [0.03, 0.05, 0.07].
-        If None, uses config.DD_THRESHOLDS.
-    prefix : str
-        Prefix for label column names. Labels for horizon h and
-        threshold δ will be named:
-
-            '{prefix}_h{h}_thr{b}'
-
-        where b = int(100 * δ), e.g. 'y_dd_h20_thr5' for 5% DD over 20 days.
-
-    Returns
-    -------
-    labels_df : pd.DataFrame
-        DataFrame with one binary column per (h, δ) combination.
-    thresholds : dict
-        Mapping from label column name -> δ (numeric threshold) so the
-        exact definition of each label is explicit.
-    """
-    if dd_thresholds is None:
-        dd_thresholds = _get_default_dd_thresholds()
-
-    labels = {}
-    thresholds: Dict[str, float] = {}
-
-    for col in dd_df.columns:
-        if not col.startswith("dd_h"):
-            continue
-        try:
-            h = int(col.split("h", 1)[1])
-        except Exception:
-            continue
-
-        series = dd_df[col].astype(float)
-
-        for delta in dd_thresholds:
-            delta = float(delta)
-            # binary: event if DD_{t,h} >= δ
-            lab_col_name = f"{prefix}_h{h}_thr{int(round(delta * 100))}"
-            labels[lab_col_name] = (series >= delta).astype(float)
-            thresholds[lab_col_name] = delta
-
-    labels_df = pd.DataFrame(labels, index=dd_df.index)
-    return labels_df, thresholds
-
-
-# ----------------------------------------------------------------------
-# High-level label construction
-# ----------------------------------------------------------------------
-
-
-@dataclass
-class LabelMetadata:
-    """
-    Metadata describing how labels were constructed.
-
-    Attributes
-    ----------
-    horizons : tuple of int
-        Horizons h used.
-    dd_thresholds : tuple of float
-        Drawdown thresholds δ used.
-    vol_quantile : float
-        Volatility quantile q used.
-    vol_thresholds : dict
-        Mapping h -> q_{Vol}(h) (numeric volatility thresholds).
-    dd_label_thresholds : dict
-        Mapping label_name -> δ (drawdown thresholds per label column).
-    """
-
-    horizons: Tuple[int, ...]
-    dd_thresholds: Tuple[float, ...]
-    vol_quantile: float
-    vol_thresholds: Dict[int, float]
-    dd_label_thresholds: Dict[str, float]
+        p = np.concatenate([[1.0], np.exp(np.cumsum(f))])
+        run_max = np.maximum.accumulate(p)
+        dd = np.min(p / run_max - 1.0)
+        out[i] = -dd  # magnitude
+    return pd.Series(out, index=rets.index, name=f"mdd_h{h}")
 
 
 def build_all_labels(
-    index_log_returns: pd.Series,
-    horizons: Sequence[int] | None = None,
-    dd_thresholds: Sequence[float] | None = None,
-    vol_quantile: float | None = None,
-) -> Tuple[pd.DataFrame, LabelMetadata]:
+    index_log_rets: pd.Series,
+    *,
+    analysis_dates: Optional[pd.DatetimeIndex] = None,
+    vol_top_pct: float = 0.03,
+    dd_tail_pcts: Tuple[float, ...] = (0.03, 0.05, 0.07),
+    label_horizons: Tuple[int, ...] = (5, 10, 20),
+) -> Tuple[pd.DataFrame, Dict]:
     """
-    Convenience function to build forward RV/DD series and all binary
-    labels in one pass.
+    Build ALL binary event labels for the pipeline, parameterized by:
+      - vol_top_pct (top X% of forward realized vol within analysis_dates)
+      - dd_tail_pcts (top X% worst forward max drawdown magnitudes within analysis_dates)
+      - label_horizons (forward horizon days)
 
-    Parameters
-    ----------
-    index_log_returns : pd.Series
-        Index log-returns r_t, indexed by date.
-    horizons : sequence of int, optional
-        Forward horizons h (days). If None, uses config.HORIZONS.
-    dd_thresholds : sequence of float, optional
-        Drawdown thresholds δ (in [0,1]). If None, config.DD_THRESHOLDS.
-    vol_quantile : float, optional
-        Volatility quantile q ∈ (0,1). If None, config.VOL_QUANTILE.
+    Naming:
+      - volatility label for horizon h:
+          y_vol_top{TAG}_h{h}
+        where TAG is derived from vol_top_pct (e.g., 0.03 -> 3)
 
-    Returns
-    -------
-    labels_df : pd.DataFrame
-        DataFrame indexed by date t, containing:
-          - forward RV series:  rv_h{h}
-          - forward DD series:  dd_h{h}
-          - volatility labels:   y_vol_h{h}
-          - drawdown labels:     y_dd_h{h}_thr{b}
-    meta : LabelMetadata
-        Metadata object with horizons, thresholds, and quantile info.
+      - drawdown label for horizon h, tail pct p:
+          y_dd_h{h}_thr{TAG}
+        where TAG is derived from p (e.g., 0.05 -> 5)
 
+    Thresholds are computed ONLY on analysis_dates (not warmup).
+    Output index is restricted to analysis_dates if provided; otherwise full index.
+
+    Returns:
+      labels_df, meta_dict
     """
-    if horizons is None:
-        horizons = _get_default_horizons()
+    if not isinstance(index_log_rets, pd.Series):
+        raise TypeError("index_log_rets must be a pd.Series of log returns indexed by date.")
+    rets = index_log_rets.sort_index().astype(float)
+
+    # define analysis slice for threshold computation
+    if analysis_dates is None:
+        analysis_dates = pd.DatetimeIndex(rets.index)
     else:
-        horizons = tuple(int(h) for h in horizons)
+        analysis_dates = pd.DatetimeIndex(analysis_dates)
+        analysis_dates = analysis_dates.intersection(rets.index)
 
-    if dd_thresholds is None:
-        dd_thresholds = _get_default_dd_thresholds()
-    else:
-        dd_thresholds = tuple(float(x) for x in dd_thresholds)
+    if len(analysis_dates) < 30:
+        raise ValueError(f"analysis_dates too small (n={len(analysis_dates)}). Need >= ~30.")
 
-    if vol_quantile is None:
-        vol_quantile = _get_default_vol_quantile()
+    vol_tag = _pct_to_tag(vol_top_pct)
 
-    # 1) Continuous forward targets
-    rv_df = compute_forward_realized_volatility(index_log_returns, horizons=horizons)
-    dd_df = compute_forward_max_drawdown(index_log_returns, horizons=horizons)
+    labels = {}
+    meta: Dict = {
+        "vol_top_pct": float(vol_top_pct),
+        "dd_tail_pcts": tuple(float(x) for x in dd_tail_pcts),
+        "label_horizons": tuple(int(h) for h in label_horizons),
+        "thresholds": {"vol": {}, "dd": {}},
+    }
 
-    # 2) Binary labels
-    vol_labels_df, vol_thr = make_volatility_labels(rv_df, vol_quantile=vol_quantile)
-    dd_labels_df, dd_thr_map = make_drawdown_labels(dd_df, dd_thresholds=dd_thresholds)
+    for h in label_horizons:
+        h = int(h)
+        if h <= 0:
+            continue
 
-    # 3) Assemble all into a single DataFrame
-    labels_df = pd.concat([rv_df, dd_df, vol_labels_df, dd_labels_df], axis=1)
+        # --- volatility ---
+        vol = _forward_realized_vol(rets, h)
+        vol_a = vol.loc[analysis_dates].dropna()
+        if len(vol_a) > 0:
+            thr_vol = float(vol_a.quantile(1.0 - float(vol_top_pct)))
+        else:
+            thr_vol = np.nan
+        meta["thresholds"]["vol"][h] = thr_vol
 
-    meta = LabelMetadata(
-        horizons=tuple(horizons),
-        dd_thresholds=tuple(dd_thresholds),
-        vol_quantile=float(vol_quantile),
-        vol_thresholds=vol_thr,
-        dd_label_thresholds=dd_thr_map,
-    )
+        vol_col = f"y_vol_top{vol_tag}_h{h}"
+        labels[vol_col] = (vol >= thr_vol).astype(float)  # float to allow NaN later
+        # restore NaNs where vol itself is NaN
+        labels[vol_col] = labels[vol_col].where(np.isfinite(vol), np.nan)
 
-    return labels_df, meta
+        # --- drawdowns ---
+        mdd = _forward_max_drawdown_mag(rets, h)
+        mdd_a = mdd.loc[analysis_dates].dropna()
+
+        meta["thresholds"]["dd"][h] = {}
+        for p in dd_tail_pcts:
+            p = float(p)
+            tag = _pct_to_tag(p)
+            if len(mdd_a) > 0:
+                thr_dd = float(mdd_a.quantile(1.0 - p))
+            else:
+                thr_dd = np.nan
+            meta["thresholds"]["dd"][h][p] = thr_dd
+
+            dd_col = f"y_dd_h{h}_thr{tag}"
+            y = (mdd >= thr_dd).astype(float)
+            y = y.where(np.isfinite(mdd), np.nan)
+            labels[dd_col] = y
+
+    df_labels = pd.DataFrame(labels, index=rets.index).sort_index()
+
+    # Restrict output rows to analysis_dates (recommended for your pipeline)
+    df_labels = df_labels.loc[analysis_dates].copy()
+
+    # Cast to Int64 (nullable) for clean CSVs and downstream handling
+    for c in df_labels.columns:
+        df_labels[c] = df_labels[c].round().astype("Int64")
+
+    return df_labels, meta
