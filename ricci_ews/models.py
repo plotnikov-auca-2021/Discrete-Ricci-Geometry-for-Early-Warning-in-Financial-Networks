@@ -28,7 +28,7 @@ pipeline.py. Here we focus on model definitions and core ML utilities.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -38,7 +38,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
 from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
     roc_auc_score,
     average_precision_score,
     brier_score_loss,
@@ -92,8 +97,10 @@ def select_feature_columns(
         curvature_cols = [c for c in all_cols if _has_prefix(c, CURVATURE_PREFIXES)]
         cols = sorted(set(baseline_cols) | set(curvature_cols))
     else:
-        raise ValueError(f"Unknown feature_group='{feature_group}'. "
-                         f"Expected one of ['baseline', 'curvature', 'all'].")
+        raise ValueError(
+            f"Unknown feature_group='{feature_group}'. "
+            f"Expected one of ['baseline', 'curvature', 'all']."
+        )
 
     return cols
 
@@ -113,16 +120,11 @@ class ModelSpec:
     name : str
         Human-readable model name (used as key in results).
     base_estimator : {"logit_l2", "logit_l1", "rf"}
-        Type of underlying estimator. You can extend this enumeration
-        if you want more model families.
+        Type of underlying estimator.
     feature_group : {"baseline", "curvature", "all"}
         Which feature subset to use.
     params : dict
-        Hyperparameters for the underlying estimator. Supported keys:
-          - For 'logit_l2' / 'logit_l1':
-                C, max_iter, class_weight, penalty, solver
-          - For 'rf':
-                n_estimators, max_depth, max_features, min_samples_leaf, etc.
+        Hyperparameters for the underlying estimator.
     """
 
     name: str
@@ -133,20 +135,11 @@ class ModelSpec:
 
 def get_default_model_specs() -> List[ModelSpec]:
     """
-    Default set of model specifications, reflecting the main comparisons
-    in the proposal:
-
-      1) Logistic regression, baseline-only features
-      2) Logistic regression, all features (curvature + baseline)
-      3) Random forest, all features (nonlinear benchmark)
-
-    You can modify or extend this list in your experiments.
+    Default set of model specifications.
     """
     rs = getattr(config, "RANDOM_STATE", 42)
 
     specs: List[ModelSpec] = [
-        # Baseline-only: does Ricci curvature add signal beyond standard
-        # market/topology/eigen features?
         ModelSpec(
             name="logit_baseline",
             base_estimator="logit_l2",
@@ -157,7 +150,6 @@ def get_default_model_specs() -> List[ModelSpec]:
                 "class_weight": "balanced",
             },
         ),
-        # Full: curvature + baseline
         ModelSpec(
             name="logit_full",
             base_estimator="logit_l2",
@@ -168,7 +160,6 @@ def get_default_model_specs() -> List[ModelSpec]:
                 "class_weight": "balanced",
             },
         ),
-        # Nonlinear benchmark
         ModelSpec(
             name="rf_full",
             base_estimator="rf",
@@ -196,24 +187,16 @@ def make_sklearn_estimator(spec: ModelSpec) -> BaseEstimator:
     """
     Build an unfitted scikit-learn estimator (possibly a Pipeline)
     from a ModelSpec.
-
-    Returns
-    -------
-    model : BaseEstimator
-        A scikit-learn object with fit/predict_proba methods.
     """
     base = spec.base_estimator.lower()
     params = dict(spec.params or {})
     rs = getattr(config, "RANDOM_STATE", 42)
 
     if base == "logit_l2":
-        # Default settings for L2 logistic regression
-        # We wrap in a Pipeline with StandardScaler because features
-        # have different scales.
         C = params.pop("C", 1.0)
         max_iter = params.pop("max_iter", 500)
         class_weight = params.pop("class_weight", "balanced")
-        # Solve options chosen for robustness
+
         logit = LogisticRegression(
             penalty="l2",
             C=C,
@@ -230,11 +213,12 @@ def make_sklearn_estimator(spec: ModelSpec) -> BaseEstimator:
                 ("clf", logit),
             ]
         )
+
     elif base == "logit_l1":
         C = params.pop("C", 1.0)
         max_iter = params.pop("max_iter", 1000)
         class_weight = params.pop("class_weight", "balanced")
-        # L1 requires saga/liblinear; we choose saga to handle multi-class if needed.
+
         logit = LogisticRegression(
             penalty="l1",
             C=C,
@@ -251,10 +235,10 @@ def make_sklearn_estimator(spec: ModelSpec) -> BaseEstimator:
                 ("clf", logit),
             ]
         )
+
     elif base == "rf":
-        # Random forest (no scaling)
-        rf = RandomForestClassifier(**params)
-        model = rf
+        model = RandomForestClassifier(**params)
+
     else:
         raise ValueError(f"Unknown base_estimator='{spec.base_estimator}'.")
 
@@ -285,6 +269,31 @@ class FittedModel:
     feature_columns: List[str]
     estimator: BaseEstimator
 
+    # ---- key fix: provide decision_function passthrough or fallback ----
+    def decision_function(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Provide a score usable for ranking-based metrics.
+        Prefer estimator.decision_function if available; otherwise fall back
+        to probabilities for class 1.
+        """
+        est = self.estimator
+        if hasattr(est, "decision_function"):
+            s = est.decision_function(X)
+            return np.asarray(s, dtype=float).ravel()
+
+        # Fall back to probability "score"
+        if hasattr(est, "predict_proba"):
+            p = est.predict_proba(X)
+            if p.ndim == 2 and p.shape[1] >= 2:
+                return np.asarray(p[:, 1], dtype=float).ravel()
+            return np.asarray(p, dtype=float).ravel()
+
+        # Last resort: class labels as score
+        if hasattr(est, "predict"):
+            return np.asarray(est.predict(X), dtype=float).ravel()
+
+        raise AttributeError("Underlying estimator has neither decision_function nor predict_proba nor predict.")
+
 
 def fit_model(
     spec: ModelSpec,
@@ -293,21 +302,7 @@ def fit_model(
 ) -> FittedModel:
     """
     Fit a model according to a ModelSpec.
-
-    Parameters
-    ----------
-    spec : ModelSpec
-        Model specification (type, feature group, hyperparameters).
-    X_train : pd.DataFrame
-        Training features, indexed by date.
-    y_train : 1D array-like
-        Training labels (0/1), aligned with X_train index.
-
-    Returns
-    -------
-    FittedModel
     """
-    # Select appropriate columns for this model
     cols = select_feature_columns(X_train, spec.feature_group)
     if not cols:
         raise ValueError(
@@ -334,19 +329,6 @@ def predict_proba(
 ) -> np.ndarray:
     """
     Predict P(y=1 | X) for a fitted model.
-
-    Parameters
-    ----------
-    fitted : FittedModel
-        Trained model and associated metadata.
-    X : pd.DataFrame
-        Feature matrix (rows = dates). Must have at least the feature
-        columns used during training.
-
-    Returns
-    -------
-    probs : np.ndarray, shape (n_samples,)
-        Predicted probabilities for the positive class (label 1).
     """
     cols = fitted.feature_columns
     missing = [c for c in cols if c not in X.columns]
@@ -359,11 +341,10 @@ def predict_proba(
     X_sub = X[cols]
     est = fitted.estimator
 
-    # All models we create implement predict_proba
     if hasattr(est, "predict_proba"):
         p = est.predict_proba(X_sub)[:, 1]
     else:
-        # as a fallback, try decision_function and pass through sigmoid
+        # fallback: decision scores -> sigmoid
         scores = est.decision_function(X_sub)
         p = 1.0 / (1.0 + np.exp(-scores))
 
@@ -386,44 +367,48 @@ def _safe_metric(fn, y_true, y_score, default=np.nan) -> float:
         return float(default)
 
 
-def evaluate_model(model, X_test, y_test, threshold: float = 0.5):
+def evaluate_model(
+    fitted: FittedModel,
+    X_test: pd.DataFrame,
+    y_test: pd.Series | np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
     """
-    Safe evaluation for rare-event labels:
-    - log_loss computed even if y_test has a single class
-    - ROC AUC / PR AUC only computed if both classes present
-    - no PR-curve warnings when there are no positives
-    """
-    import numpy as np
-    from sklearn.metrics import (
-        accuracy_score, precision_score, recall_score, f1_score,
-        roc_auc_score, average_precision_score,
-        brier_score_loss, log_loss
-    )
+    Safe evaluation for rare-event labels.
 
+    IMPORTANT FIXES vs previous version:
+      - Uses our own `predict_proba(fitted, ...)` so feature column selection is correct.
+      - Does NOT require `decision_function` at all (but FittedModel now supports it anyway).
+      - Computes log_loss even for single-class y_test using labels=[0,1].
+      - Computes ROC AUC / PR AUC only when both classes are present.
+      - Returns consistent metric keys used by the pipeline (accuracy, precision, recall, f1, brier, logloss, auc, ap).
+    """
     y = np.asarray(y_test).astype(int)
 
-    # probabilities
-    if hasattr(model, "predict_proba"):
-        p = model.predict_proba(X_test)[:, 1]
-    else:
-        # fallback: treat decision_function outputs as logits
-        s = model.decision_function(X_test)
-        p = 1.0 / (1.0 + np.exp(-s))
+    # Ensure we use the correct feature subset
+    cols = fitted.feature_columns
+    missing = [c for c in cols if c not in X_test.columns]
+    if missing:
+        raise ValueError(
+            f"Missing columns in X_test for evaluation: {missing}. "
+            "Ensure feature construction is consistent between train/test."
+        )
+    X_sub = X_test[cols]
 
+    # Probabilities for the positive class
+    p = predict_proba(fitted, X_sub)
     p = np.asarray(p, dtype=float)
     p = np.clip(p, 1e-12, 1 - 1e-12)
 
     y_pred = (p >= threshold).astype(int)
 
-    out = {}
+    out: Dict[str, float] = {}
     out["n_samples"] = int(len(y))
     out["pos_rate"] = float(np.mean(y)) if len(y) else np.nan
 
-    # Always defined (even if y is all 0s), as long as we set labels
-    out["log_loss"] = float(log_loss(y, p, labels=[0, 1]))
+    out["logloss"] = float(log_loss(y, p, labels=[0, 1]))
     out["brier"] = float(brier_score_loss(y, p))
 
-    # Standard classification metrics (may be ill-defined if no positives; use zero_division=0)
     out["accuracy"] = float(accuracy_score(y, y_pred))
     out["precision"] = float(precision_score(y, y_pred, zero_division=0))
     out["recall"] = float(recall_score(y, y_pred, zero_division=0))
@@ -431,11 +416,11 @@ def evaluate_model(model, X_test, y_test, threshold: float = 0.5):
 
     # AUC metrics only if both classes present
     if len(np.unique(y)) == 2:
-        out["roc_auc"] = float(roc_auc_score(y, p))
-        out["pr_auc"] = float(average_precision_score(y, p))
+        out["auc"] = float(roc_auc_score(y, p))
+        out["ap"] = float(average_precision_score(y, p))
     else:
-        out["roc_auc"] = np.nan
-        out["pr_auc"] = np.nan
+        out["auc"] = np.nan
+        out["ap"] = np.nan
 
     out["error"] = ""
     return out

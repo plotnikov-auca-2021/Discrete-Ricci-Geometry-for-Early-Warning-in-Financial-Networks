@@ -845,15 +845,44 @@ def run_step_features(out_dir: str, cfg: PipelineConfig) -> None:
 # STEP 5: Models (labels fully parameterized)
 # ---------------------------------------------------------------------
 
-def run_step_models(out_dir: str, cfg: PipelineConfig) -> None:
+def run_step_models(out_dir: str, cfg: "PipelineConfig") -> None:
     """
-    Train/evaluate models for label columns discovered from cfg.
+    Train/evaluate models for all label columns in features_and_labels.csv.
+
+    CHANGE REQUEST (from user):
+    ---------------------------
+    Instead of splitting chronologically by time, split by *events* so that
+    BOTH train and test contain (approximately) the SAME NUMBER OF POSITIVE EVENTS.
+
+    Implementation details:
+    - We still keep a time-order within each split (no shuffling of samples),
+      but we choose a cutoff date such that cumulative positives up to cutoff
+      is ~ half of total positives (for the chosen label).
+    - Because each label has different event frequency, the split is computed
+      PER LABEL (most robust), producing potentially different split dates
+      across labels.
+      This avoids impossible constraints when event rates differ.
 
     Robustness:
-      - Handles single-class y_train with constant fallback
-      - Imputes NaN/Inf features with train medians
-      - Avoids hard dependency on decision_function for AUC (models.evaluate_model may fail)
+    - Drops rows where y is NaN (label horizon tail).
+    - Imputes NaN/Inf features with train medians.
+    - If y_train becomes single-class (rare with event-balanced split, but can happen
+      for extremely sparse labels), falls back to constant predictor.
+    - Produces:
+        * model_predictions.csv (per date, y_true, p_hat, model, label)
+        * model_metrics.csv     (per model x label)
+
+    Notes:
+    - For AUC you need both classes in y_true. If test has only one class,
+      AUC is left NaN.
+    - Some sklearn models expose decision_function; many do not.
+      Our evaluation uses predicted probabilities; no decision_function required.
     """
+    import os
+    import re
+    import numpy as np
+    import pandas as pd
+
     os.makedirs(out_dir, exist_ok=True)
 
     feats_path = os.path.join(out_dir, "features_and_labels.csv")
@@ -861,194 +890,331 @@ def run_step_models(out_dir: str, cfg: PipelineConfig) -> None:
     metrics_path = os.path.join(out_dir, "model_metrics.csv")
 
     if not os.path.exists(feats_path):
-        raise FileNotFoundError(f"Missing {feats_path}. Run `features` step first.")
+        raise FileNotFoundError(
+            f"Features CSV not found: {feats_path}. Run `features` step first."
+        )
 
     df = pd.read_csv(feats_path, parse_dates=["date"])
     if df.empty:
         raise ValueError("features_and_labels.csv is empty.")
     df = df.sort_values("date").set_index("date")
 
-    # ----- label discovery based on cfg (supports old and new volatility naming) -----
-    import re
+    # ---------------------------
+    # Discover labels based on your naming conventions
+    # ---------------------------
+    # volatility: y_vol_top{pct*100}_h{h}
+    vol_pat = re.compile(r"^y_vol_top(\d+)_h(\d+)$", re.IGNORECASE)
+    # drawdown: y_dd_h{h}_thr{thr}
+    dd_pat = re.compile(r"^y_dd_h(\d+)_thr(\d+)$", re.IGNORECASE)
 
-    desired_horizons = set(int(x) for x in cfg.label_horizons)
-    desired_dd_tags = set(_pct_to_tag(x) for x in cfg.dd_tail_pcts)
-    desired_vol_tag = _pct_to_tag(cfg.vol_top_pct)
-
-    vol_pat_old = re.compile(r"^y_vol_h(\d+)$", re.IGNORECASE)
-    vol_pat_new = re.compile(r"^y_vol_top([0-9p]+)_h(\d+)$", re.IGNORECASE)
-    dd_pat = re.compile(r"^y_dd_h(\d+)_thr([0-9p]+)$", re.IGNORECASE)
-
-    label_info_map: Dict[str, Dict] = {}
+    label_info_map = {}
     for c in df.columns:
-        m = vol_pat_new.match(c)
-        if m:
-            tag = m.group(1)
-            h = int(m.group(2))
-            if (h in desired_horizons) and (tag == desired_vol_tag):
-                label_info_map[c] = {"event_type": "vol", "horizon_days": h, "threshold": None, "tag": tag}
+        m1 = vol_pat.match(c)
+        if m1:
+            label_info_map[c] = {
+                "event_type": "vol",
+                "top_pct_int": int(m1.group(1)),
+                "horizon_days": int(m1.group(2)),
+                "threshold": None,
+            }
             continue
+        m2 = dd_pat.match(c)
+        if m2:
+            label_info_map[c] = {
+                "event_type": "dd",
+                "top_pct_int": None,
+                "horizon_days": int(m2.group(1)),
+                "threshold": int(m2.group(2)),
+            }
 
-        m = vol_pat_old.match(c)
-        if m:
-            h = int(m.group(1))
-            if h in desired_horizons:
-                # accept old naming if present; tag is None
-                label_info_map[c] = {"event_type": "vol", "horizon_days": h, "threshold": None, "tag": None}
+    found_labels = list(label_info_map.keys())
+    print(f"[models] Discovered labels ({len(found_labels)}): {found_labels}")
+
+    # Use config-driven horizons/thresholds if available
+    desired_horizons = set(getattr(cfg, "label_horizons", (5, 10, 20)))
+    desired_dd_thresholds = set(getattr(cfg, "dd_tail_pcts", (0.03, 0.05, 0.07)))
+    # dd_tail_pcts are floats; your label names use thr3,thr5,thr7 (integers)
+    # We'll map 0.03->3, 0.05->5, 0.07->7 if floats are given:
+    dd_thr_ints = set()
+    for x in desired_dd_thresholds:
+        if isinstance(x, float):
+            dd_thr_ints.add(int(round(100 * x)))
+        else:
+            dd_thr_ints.add(int(x))
+
+    # volatility label naming uses top_pct in integer percent (e.g. 3 for top 3%)
+    vol_top_pct = getattr(cfg, "vol_top_pct", 0.03)
+    vol_top_int = int(round(100 * vol_top_pct))
+
+    label_cols = []
+    for c, info in label_info_map.items():
+        if info["horizon_days"] not in desired_horizons:
             continue
+        if info["event_type"] == "vol":
+            if info["top_pct_int"] == vol_top_int:
+                label_cols.append(c)
+        elif info["event_type"] == "dd":
+            if info["threshold"] in dd_thr_ints:
+                label_cols.append(c)
 
-        m = dd_pat.match(c)
-        if m:
-            h = int(m.group(1))
-            tag = m.group(2)
-            if (h in desired_horizons) and (tag in desired_dd_tags):
-                label_info_map[c] = {"event_type": "dd", "horizon_days": h, "threshold": tag, "tag": tag}
+    def _sort_key(name: str):
+        info = label_info_map[name]
+        if info["event_type"] == "vol":
+            return (0, info["horizon_days"], -1)
+        return (1, info["horizon_days"], info["threshold"])
 
-    label_cols = sorted(
-        label_info_map.keys(),
-        key=lambda name: (
-            0 if label_info_map[name]["event_type"] == "vol" else 1,
-            label_info_map[name]["horizon_days"],
-            str(label_info_map[name]["threshold"]),
-            name,
-        ),
-    )
+    label_cols = sorted(label_cols, key=_sort_key)
 
-    print(f"[models] Discovered labels ({len(label_cols)}): {label_cols}")
     if not label_cols:
         raise ValueError(
-            "No label columns found matching current cfg.\n"
-            f"cfg.label_horizons={cfg.label_horizons}, cfg.vol_top_pct={cfg.vol_top_pct}, cfg.dd_tail_pcts={cfg.dd_tail_pcts}\n"
-            "Tip: re-run `features` step after changing label parameters."
+            "No labels selected. Check that features_and_labels.csv contains "
+            "labels matching your configured horizons/thresholds."
         )
 
-    # ----- feature columns -----
+    print("[models] Using labels:")
+    for c in label_cols:
+        info = label_info_map[c]
+        print(
+            f"  - {c} (event={info['event_type']}, horizon={info['horizon_days']}, thr={info['threshold']}, top={info.get('top_pct_int')})"
+        )
+
+    # ---------------------------
+    # Feature columns
+    # ---------------------------
     meta_cols = ["window_id", "window_start", "window_end", "n_days", "n_assets"]
     meta_cols = [c for c in meta_cols if c in df.columns]
     feature_cols = [c for c in df.columns if c not in meta_cols and c not in label_cols]
-
     if not feature_cols:
         raise ValueError("No feature columns found after excluding meta+label columns.")
 
-    X = df[feature_cols].replace([np.inf, -np.inf], np.nan)
-
-    # ----- chronological split (adaptive for small sample sizes) -----
-    n = len(X)
-    min_test = 30
-    min_train = 50
-    if n < (min_train + min_test):
-        raise ValueError(
-            f"Not enough rows for modeling (n={n}). Need at least {min_train + min_test}.\n"
-            "Increase analysis_years / reduce stride / generate more endpoints."
-        )
-
-    split_idx = max(int(0.7 * n), n - min_test)
-    split_idx = max(split_idx, min_train)
-
-    train_idx = X.index[:split_idx]
-    test_idx = X.index[split_idx:]
-
-    X_train = X.loc[train_idx]
-    X_test = X.loc[test_idx]
-
-    med = X_train.median(axis=0, numeric_only=True)
-    X_train = X_train.fillna(med)
-    X_test = X_test.fillna(med)
-
-    print(f"[models] Total samples: {n} | Train: {len(train_idx)} | Test: {len(test_idx)}")
+    X_all = df[feature_cols].copy().replace([np.inf, -np.inf], np.nan)
+    print(f"[models] Total samples: {len(df)}")
     print(f"[models] Features: {len(feature_cols)}")
 
+    # ---------------------------
+    # Models
+    # ---------------------------
     specs = models.get_default_model_specs()
     if not specs:
         raise ValueError("models.get_default_model_specs() returned empty list.")
 
-    def _constant_proba(y_train_l: pd.Series, n_test: int) -> np.ndarray:
-        p = float(np.clip(y_train_l.mean(), 0.0, 1.0))
-        return np.full(n_test, p, dtype=float)
+    # ---------------------------
+    # Utility: event-balanced chronological split
+    # ---------------------------
+    def _event_balanced_split_dates(y_series: pd.Series) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex, dict]:
+        """
+        Given a label series y indexed by date, choose a cutoff date such that
+        train/test have ~equal number of positive events.
+
+        Returns train_dates, test_dates, meta dict.
+
+        Strategy:
+        - Drop NaNs in y (horizon tail).
+        - Let total_pos = sum(y==1).
+        - If total_pos < 2, can't split by events -> fallback to 70/30 time split.
+        - Find earliest date where cumulative positives >= ceil(total_pos/2),
+          use that as last train date. Everything after is test.
+        - Ensure both sets non-empty and contain at least 1 positive if possible.
+        """
+        y_nonan = y_series.dropna().astype(int)
+        dates = y_nonan.index
+        n = len(y_nonan)
+        if n < 50:
+            # too tiny overall: fallback simple
+            split_idx = max(int(0.7 * n), 1)
+            return dates[:split_idx], dates[split_idx:], {
+                "split_mode": "fallback_time_small_n",
+                "total_pos": int(y_nonan.sum()),
+                "train_pos": int(y_nonan.iloc[:split_idx].sum()),
+                "test_pos": int(y_nonan.iloc[split_idx:].sum()),
+                "cutoff_date": dates[split_idx - 1] if split_idx > 0 else None,
+            }
+
+        total_pos = int(y_nonan.sum())
+        if total_pos < 2:
+            # Not enough events to split meaningfully; fallback chronological
+            split_idx = int(0.7 * n)
+            split_idx = min(max(split_idx, 1), n - 1)
+            return dates[:split_idx], dates[split_idx:], {
+                "split_mode": "fallback_time_few_events",
+                "total_pos": total_pos,
+                "train_pos": int(y_nonan.iloc[:split_idx].sum()),
+                "test_pos": int(y_nonan.iloc[split_idx:].sum()),
+                "cutoff_date": dates[split_idx - 1],
+            }
+
+        target_train_pos = int(np.ceil(total_pos / 2))
+        cpos = y_nonan.cumsum()
+
+        # first index where cum positives >= half
+        idx = int(np.searchsorted(cpos.values, target_train_pos, side="left"))
+        idx = min(max(idx, 0), n - 2)  # keep at least 1 obs for test
+        cutoff_date = dates[idx]
+
+        train_dates = dates[: idx + 1]
+        test_dates = dates[idx + 1 :]
+
+        train_pos = int(y_nonan.loc[train_dates].sum())
+        test_pos = int(y_nonan.loc[test_dates].sum())
+
+        # If test ended up with 0 positives (possible when events are clustered early),
+        # push cutoff earlier until test has at least 1 positive (if possible).
+        if test_pos == 0 and total_pos > 0:
+            # move cutoff backwards until test has positives or train becomes too small
+            j = idx
+            while j > 10 and int(y_nonan.iloc[j + 1 :].sum()) == 0:
+                j -= 1
+            if j != idx:
+                cutoff_date = dates[j]
+                train_dates = dates[: j + 1]
+                test_dates = dates[j + 1 :]
+                train_pos = int(y_nonan.loc[train_dates].sum())
+                test_pos = int(y_nonan.loc[test_dates].sum())
+
+        return train_dates, test_dates, {
+            "split_mode": "event_balanced",
+            "total_pos": total_pos,
+            "target_train_pos": target_train_pos,
+            "train_pos": train_pos,
+            "test_pos": test_pos,
+            "cutoff_date": cutoff_date,
+        }
+
+    # ---------------------------
+    # Metrics helper (no decision_function needed)
+    # ---------------------------
+    def _safe_auc(y_true: np.ndarray, p_hat: np.ndarray) -> float:
+        try:
+            from sklearn.metrics import roc_auc_score
+            if len(np.unique(y_true)) < 2:
+                return np.nan
+            return float(roc_auc_score(y_true, p_hat))
+        except Exception:
+            return np.nan
 
     def _basic_metrics(y_true: np.ndarray, p_hat: np.ndarray) -> dict:
         eps = 1e-12
-        p = np.clip(p_hat, eps, 1 - eps)
-        y = y_true.astype(float)
+        p = np.clip(np.asarray(p_hat, dtype=float), eps, 1 - eps)
+        y = np.asarray(y_true, dtype=int)
+
         y_pred = (p >= 0.5).astype(int)
 
-        acc = float((y_pred == y_true).mean()) if len(y_true) else np.nan
-        brier = float(np.mean((p - y) ** 2)) if len(y_true) else np.nan
-        logloss = float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))) if len(y_true) else np.nan
+        acc = float((y_pred == y).mean()) if len(y) else np.nan
+        brier = float(np.mean((p - y) ** 2)) if len(y) else np.nan
+        logloss = float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))) if len(y) else np.nan
 
-        tp = int(((y_pred == 1) & (y_true == 1)).sum())
-        fp = int(((y_pred == 1) & (y_true == 0)).sum())
-        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+        tp = int(((y_pred == 1) & (y == 1)).sum())
+        fp = int(((y_pred == 1) & (y == 0)).sum())
+        fn = int(((y_pred == 0) & (y == 1)).sum())
 
-        prec = tp / (tp + fp) if (tp + fp) > 0 else np.nan
-        rec = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-        f1 = (2 * prec * rec / (prec + rec)) if (prec == prec and rec == rec and (prec + rec) > 0) else np.nan
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        auc = _safe_auc(y, p)
 
         return {
             "accuracy": acc,
             "brier": brier,
             "logloss": logloss,
-            "precision": float(prec) if prec == prec else np.nan,
-            "recall": float(rec) if rec == rec else np.nan,
-            "f1": float(f1) if f1 == f1 else np.nan,
-            "auc": np.nan,
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1) if (len(np.unique(y)) >= 2) else np.nan,  # f1 is defined even for one class, but keep consistent
+            "auc": auc,
             "error": "",
         }
 
-    pred_frames: List[pd.DataFrame] = []
-    metrics_rows: List[Dict] = []
-    skip_summary: List[Tuple[str, str]] = []
+    def _constant_proba(y_train_l: pd.Series, n_test: int) -> np.ndarray:
+        p = float(np.clip(y_train_l.mean(), 0.0, 1.0))
+        return np.full(n_test, p, dtype=float)
 
+    pred_frames = []
+    metrics_rows = []
+    skip_summary = []
+
+    # ---------------------------
+    # Train/eval loop (PER LABEL event-balanced split)
+    # ---------------------------
     for label_name in label_cols:
         info = label_info_map[label_name]
-        y = df[label_name]
+        y_raw = df[label_name]
 
-        y_train = y.loc[train_idx]
-        y_test = y.loc[test_idx]
+        # Determine split dates based on events
+        train_dates, test_dates, split_meta = _event_balanced_split_dates(y_raw)
 
-        # drop NaNs in y
-        tr_mask = np.isfinite(y_train.values.astype(float))
-        te_mask = np.isfinite(y_test.values.astype(float))
+        # Build X/y for those dates (drop NaN labels)
+        y_nonan = y_raw.dropna().astype(int)
+        train_dates = pd.DatetimeIndex([d for d in train_dates if d in y_nonan.index])
+        test_dates = pd.DatetimeIndex([d for d in test_dates if d in y_nonan.index])
 
-        X_train_l = X_train.loc[y_train.index[tr_mask]]
-        y_train_l = y_train.loc[y_train.index[tr_mask]].astype(int)
-
-        X_test_l = X_test.loc[y_test.index[te_mask]]
-        y_test_l = y_test.loc[y_test.index[te_mask]].astype(int)
-
-        if len(X_train_l) < min_train or len(X_test_l) < min_test:
-            skip_summary.append((label_name, f"too_few_samples train={len(X_train_l)} test={len(X_test_l)}"))
+        if len(train_dates) == 0 or len(test_dates) == 0:
+            skip_summary.append((label_name, "empty_train_or_test_after_dropna"))
             continue
 
-        y_train_unique = sorted(set(y_train_l.unique().tolist()))
-        y_test_unique = sorted(set(y_test_l.unique().tolist()))
+        X_train = X_all.loc[train_dates].copy()
+        X_test = X_all.loc[test_dates].copy()
+        y_train = y_nonan.loc[train_dates]
+        y_test = y_nonan.loc[test_dates]
+
+        # Impute missing features using train medians (per label split)
+        med = X_train.median(axis=0, numeric_only=True)
+        X_train = X_train.fillna(med)
+        X_test = X_test.fillna(med)
+
+        # Sanity: still may contain NaNs if a column is entirely NaN in train
+        X_train = X_train.fillna(0.0)
+        X_test = X_test.fillna(0.0)
+
+        y_train_unique = sorted(set(y_train.unique().tolist()))
+        y_test_unique = sorted(set(y_test.unique().tolist()))
+
+        if len(X_train) < 50 or len(X_test) < 30:
+            skip_summary.append((label_name, f"too_few_samples train={len(X_train)} test={len(X_test)}"))
+            continue
+
         train_single_class = (len(y_train_unique) < 2)
+
+        print(
+            f"[models] Label={label_name} | split={split_meta.get('split_mode')} "
+            f"| total_pos={split_meta.get('total_pos')} "
+            f"| train_pos={split_meta.get('train_pos')} test_pos={split_meta.get('test_pos')} "
+            f"| train_n={len(X_train)} test_n={len(X_test)} "
+            f"| cutoff={split_meta.get('cutoff_date')}"
+        )
 
         for spec in specs:
             fit_status = "ok"
+            eval_result = {}
+            p_test = None
+
             if train_single_class:
-                p_test = _constant_proba(y_train_l, len(X_test_l))
-                eval_result = _basic_metrics(y_test_l.values, p_test)
+                # constant fallback
+                p_test = _constant_proba(y_train, len(X_test))
+                eval_result = _basic_metrics(y_test.values, p_test)
                 fit_status = "constant_fallback_single_class_train"
             else:
                 try:
-                    fitted = models.fit_model(spec, X_train_l, y_train_l)
-                    p_test = models.predict_proba(fitted, X_test_l)
+                    fitted = models.fit_model(spec, X_train, y_train)
+                    p_test = models.predict_proba(fitted, X_test)
 
+                    # Prefer package evaluation if it works; otherwise fallback
                     try:
-                        eval_result = models.evaluate_model(fitted, X_test_l, y_test_l)
+                        eval_result = models.evaluate_model(fitted, X_test, y_test)
                         if "error" not in eval_result:
                             eval_result["error"] = ""
+                        # Ensure auc exists (some evaluate_model versions omit it)
+                        if "auc" not in eval_result or eval_result.get("auc") is None:
+                            eval_result["auc"] = _safe_auc(y_test.values, np.asarray(p_test))
                     except Exception as e_eval:
-                        eval_result = _basic_metrics(y_test_l.values, p_test)
+                        eval_result = _basic_metrics(y_test.values, p_test)
                         eval_result["error"] = f"evaluate_failed: {str(e_eval)}"
 
                 except Exception as e_fit:
-                    p_test = _constant_proba(y_train_l, len(X_test_l))
-                    eval_result = _basic_metrics(y_test_l.values, p_test)
+                    p_test = _constant_proba(y_train, len(X_test))
+                    eval_result = _basic_metrics(y_test.values, p_test)
                     fit_status = "constant_fallback_fit_failed"
                     eval_result["error"] = f"fit_failed: {str(e_fit)}"
 
+            # Metrics row
             mrow = dict(eval_result)
             mrow.update(
                 {
@@ -1057,26 +1223,36 @@ def run_step_models(out_dir: str, cfg: PipelineConfig) -> None:
                     "label_name": label_name,
                     "event_type": info["event_type"],
                     "horizon_days": info["horizon_days"],
-                    "threshold": info["threshold"],  # dd tag string or None
-                    "n_train": int(len(X_train_l)),
-                    "n_test": int(len(X_test_l)),
+                    "threshold": info["threshold"],
+                    "vol_top_pct_int": info.get("top_pct_int"),
+                    "n_train": int(len(X_train)),
+                    "n_test": int(len(X_test)),
                     "y_train_unique": ",".join(map(str, y_train_unique)),
                     "y_test_unique": ",".join(map(str, y_test_unique)),
+                    "split_mode": split_meta.get("split_mode"),
+                    "split_cutoff_date": split_meta.get("cutoff_date"),
+                    "total_pos": split_meta.get("total_pos"),
+                    "train_pos": split_meta.get("train_pos"),
+                    "test_pos": split_meta.get("test_pos"),
                 }
             )
             metrics_rows.append(mrow)
 
+            # Predictions rows
             df_pred = pd.DataFrame(
                 {
-                    "date": X_test_l.index,
+                    "date": X_test.index,
                     "model_name": spec.name,
                     "label_name": label_name,
                     "event_type": info["event_type"],
                     "horizon_days": info["horizon_days"],
                     "threshold": info["threshold"],
-                    "y_true": y_test_l.values.astype(int),
+                    "vol_top_pct_int": info.get("top_pct_int"),
+                    "y_true": y_test.values.astype(int),
                     "p_hat": np.asarray(p_test, dtype=float),
                     "fit_status": fit_status,
+                    "split_mode": split_meta.get("split_mode"),
+                    "split_cutoff_date": split_meta.get("cutoff_date"),
                 }
             )
             pred_frames.append(df_pred)
@@ -1084,9 +1260,9 @@ def run_step_models(out_dir: str, cfg: PipelineConfig) -> None:
     if not pred_frames:
         msg = (
             "No predictions were produced.\n"
-            f"n={n}, train={len(train_idx)}, test={len(test_idx)}\n"
-            f"skip_summary(first 10)={skip_summary[:10]}\n"
-            "Try: increase analysis_years, reduce stride, or relax min_train/min_test.\n"
+            f"skip_summary(first 20)={skip_summary[:20]}\n"
+            "Try: verify labels are not mostly NaN/constant; ensure enough samples; "
+            "or relax the hard minimums (train>=50/test>=30) inside run_step_models.\n"
         )
         raise ValueError(msg)
 
@@ -1104,9 +1280,8 @@ def run_step_models(out_dir: str, cfg: PipelineConfig) -> None:
     preds_all.to_csv(preds_path, index=False)
     metrics_all.to_csv(metrics_path, index=False)
 
-    print(f"[models] Wrote predictions: {preds_path} rows={len(preds_all)}")
-    print(f"[models] Wrote metrics:     {metrics_path} rows={len(metrics_all)}")
-
+    print(f"[models] Wrote predictions to {preds_path} (rows={len(preds_all)})")
+    print(f"[models] Wrote metrics to {metrics_path} (rows={len(metrics_all)})")
 
 # ---------------------------------------------------------------------
 # STEP 6: Mechanistic probes (ALL predicted dates)

@@ -41,7 +41,7 @@ import os
 class PipelineConfig:
     # --- Data slicing ---
     warmup_years: int = 1
-    analysis_years: int = 1  # you said you'll decide; keep default = 1
+    analysis_years: int = 5  # you said you'll decide; keep default = 1
 
     # --- Rolling windows ---
     window_stride_days: int = 1  # stride=1 means daily endpoints
@@ -50,7 +50,7 @@ class PipelineConfig:
     n_workers: int = 2  # increase on desktop/cloud
 
     # --- Curvature controls ---
-    compute_orc: bool = False  # OFF by default (FRC-only pipeline)
+    compute_orc: bool = True  # OFF by default (FRC-only pipeline)
 
     # --- Label parameters (ALL adjustable) ---
     vol_top_pct: float = 0.03
@@ -107,10 +107,10 @@ def get_pipeline_config() -> PipelineConfig:
     """
     cfg = PipelineConfig(
         warmup_years=_env_int("PIPE_WARMUP_YEARS", 1),
-        analysis_years=_env_int("PIPE_ANALYSIS_YEARS", 1),
+        analysis_years=_env_int("PIPE_ANALYSIS_YEARS", 5),
         window_stride_days=_env_int("PIPE_STRIDE", 1),
         n_workers=_env_int("PIPE_NWORKERS", 2),
-        compute_orc=_env_bool("PIPE_COMPUTE_ORC", False),
+        compute_orc=_env_bool("PIPE_COMPUTE_ORC", True),
         vol_top_pct=_env_float("PIPE_VOL_TOP_PCT", 0.03),
         dd_tail_pcts=_env_tuple_float("PIPE_DD_TAIL_PCTS", (0.03, 0.05, 0.07)),
         label_horizons=_env_tuple_int("PIPE_LABEL_HORIZONS", (5, 10, 20)),
