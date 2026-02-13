@@ -153,6 +153,17 @@ def label_short_id(label_name: str) -> str:
         return f"Volatility top {li.vol_top_pct_int}%, horizon {li.horizon_days}d"
     return f"Drawdown ≥{li.dd_thr_int}%, horizon {li.horizon_days}d"
 
+def label_shorter_id(label_name: str) -> str:
+    """
+    Even shortert, still readable id for filenames and compact axes.
+    """
+    li = parse_label_info(str(label_name))
+    if not li:
+        return str(label_name)
+    if li.event_type == "vol":
+        return f"Vol. {li.vol_top_pct_int}%, h {li.horizon_days}d"
+    return f"Dd ≥{li.dd_thr_int}%, h {li.horizon_days}d"
+
 
 def pretty_metric_name(metric_col: str) -> str:
     m = str(metric_col)
@@ -399,7 +410,7 @@ def barplot_delta_auc(delta_df: pd.DataFrame, out_dir: Path,
         print("[warn] No delta_auc values; skipping delta plot.")
         return
 
-    df["label_short"] = df["label_name"].astype(str).map(label_short_id)
+    df["label_short"] = df["label_name"].astype(str).map(label_shorter_id)
 
     title_a = pretty_model_name(model_a)
     title_b = pretty_model_name(model_b)
